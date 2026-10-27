@@ -84,6 +84,12 @@ pub trait Domain: Send + Sync + 'static {
     /// The side data as of the index's last commit, cutting off what a crash left past it.
     fn open(&self, snapshot: &Snapshot<Self::Key, Self::Unit>) -> io::Result<Self::Side>;
 
+    /// Makes the side data durable before the index commits (flushing what [`Domain::apply`] buffered), and returns
+    /// it as readers will see it.
+    fn seal(&self, side: Self::Side) -> io::Result<Self::Side> {
+        Ok(side)
+    }
+
     /// Writes the batch's side data and adds each record to `index`, in order (so `batch[i]` becomes source
     /// `first + i`), and returns the side data with them. The collection commits the index after.
     fn apply(&self, batch: &[Self::Record], first: u32, side: &Self::Side, index: &Index<Self::Key, Self::Unit>) -> io::Result<Self::Side>;
@@ -379,6 +385,7 @@ impl<D: Domain> Collection<D> {
         }
         let added = applied + batch.len() as u32;
         if added > 0 {
+            side = self.domain.seal(side)?;
             self.crash_at(1)?;
             self.index.commit()?;
         }
@@ -420,7 +427,7 @@ impl<D: Domain> Collection<D> {
         if self.current().sources > 0 || !w.pending.is_empty() {
             return Err(invalid("load needs an empty collection"));
         }
-        let side = apply(&self.index)?;
+        let side = self.domain.seal(apply(&self.index)?)?;
         self.index.commit()?;
         let snapshot = self.index.snapshot();
         let sources = snapshot.source_count();
