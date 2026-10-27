@@ -65,6 +65,17 @@ pub trait Domain: Send + Sync + 'static {
 
     fn key(&self, record: &Self::Record) -> Self::Key;
 
+    /// Whether [`Domain::apply`] runs as records arrive (each `add`, once logged) rather than at commit: for domains
+    /// whose records are large beside what they invert into (documents), so a commit's records aren't all held.
+    fn eager(&self) -> bool {
+        false
+    }
+
+    /// With [`Domain::eager`], an add commits once the index buffers more than this.
+    fn flush_bytes(&self) -> usize {
+        usize::MAX
+    }
+
     /// Rejects a record before it's logged.
     fn check(&self, _record: &Self::Record) -> Result<(), String> {
         Ok(())
@@ -101,6 +112,8 @@ impl<D: Domain> Generation<D> {
 
 enum Op<R, K> {
     Add(R),
+    /// An add a domain that applies on arrival ([`Domain::eager`]) has applied: its source is in the index's buffer.
+    Applied(K),
     Delete(K),
 }
 
@@ -117,8 +130,12 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-struct Writer<R, K> {
+struct Writer<R, K, S> {
     pending: Vec<Op<R, K>>,
+    /// The side data with the adds applied since the last commit (eager domains).
+    side: Option<S>,
+    /// Adds applied since the last commit.
+    applied: u32,
     /// Operations logged since the collection began, up to the pending ones.
     ops: u64,
 }
@@ -130,7 +147,7 @@ pub struct Collection<D: Domain> {
     index: Index<D::Key, D::Unit>,
     keys: KeyTable,
     log: Log,
-    writer: Mutex<Writer<D::Record, D::Key>>,
+    writer: Mutex<Writer<D::Record, D::Key, D::Side>>,
     current: RwLock<Arc<Generation<D>>>,
 }
 
@@ -150,7 +167,7 @@ impl<D: Domain> Collection<D> {
             index,
             keys,
             log,
-            writer: Mutex::new(Writer { pending: Vec::new(), ops: 0 }),
+            writer: Mutex::new(Writer { pending: Vec::new(), side: None, applied: 0, ops: 0 }),
             current: RwLock::new(Arc::new(Generation { snapshot, side, deleted: Arc::new(SourceSet::new(sources)), sources })),
         };
         collection.recover()?;
@@ -229,6 +246,7 @@ impl<D: Domain> Collection<D> {
                         pending.push(Op::Delete(key));
                     }
                 }
+                Op::Applied(_) => unreachable!("the log holds records"),
             }
         }
         let done = base_ops + logged - pending.len() as u64;
@@ -262,7 +280,7 @@ impl<D: Domain> Collection<D> {
         Ok(())
     }
 
-    fn reset_log(&self, w: &Writer<D::Record, D::Key>) -> io::Result<()> {
+    fn reset_log(&self, w: &Writer<D::Record, D::Key, D::Side>) -> io::Result<()> {
         let mut checkpoint = (self.current().sources as u64).to_le_bytes().to_vec();
         checkpoint.extend_from_slice(&w.ops.to_le_bytes());
         self.log.reset(&checkpoint)
@@ -289,7 +307,20 @@ impl<D: Domain> Collection<D> {
             .collect();
         let mut w = self.writer.lock().unwrap();
         self.log_ops(logged)?;
-        w.pending.extend(records.into_iter().map(Op::Add));
+        if !self.domain.eager() {
+            w.pending.extend(records.into_iter().map(Op::Add));
+            return Ok(());
+        }
+        // applied now, in log order, so each source's ordinal is the one recovery would give it
+        let current = self.current();
+        let first = current.sources + w.applied;
+        let side = self.domain.apply(&records, first, w.side.as_ref().unwrap_or(&current.side), &self.index)?;
+        w.side = Some(side);
+        w.applied += records.len() as u32;
+        w.pending.extend(records.iter().map(|r| Op::Applied(self.domain.key(r))));
+        if self.index.buffered_bytes() > self.domain.flush_bytes() {
+            self.commit_locked(&mut w)?;
+        }
         Ok(())
     }
 
@@ -313,47 +344,60 @@ impl<D: Domain> Collection<D> {
     /// Applies everything logged since the last commit and publishes it.
     pub fn commit(&self) -> io::Result<()> {
         let mut w = self.writer.lock().unwrap();
+        self.commit_locked(&mut w)
+    }
+
+    fn commit_locked(&self, w: &mut Writer<D::Record, D::Key, D::Side>) -> io::Result<()> {
         if w.pending.is_empty() {
             return Ok(());
         }
         let ops = std::mem::take(&mut w.pending);
         let count = ops.len() as u64;
+        // the adds not yet applied (all of them, unless the domain is eager; then only those replayed from the log,
+        // which come before any applied on arrival), and each operation's key in order
         let mut batch = Vec::new();
         let mut order: Vec<Op<(), D::Key>> = Vec::with_capacity(ops.len());
         for op in ops {
             match op {
                 Op::Add(r) => {
+                    order.push(Op::Applied(self.domain.key(&r)));
                     batch.push(r);
-                    order.push(Op::Add(()));
                 }
+                Op::Applied(k) => order.push(Op::Applied(k)),
                 Op::Delete(k) => order.push(Op::Delete(k)),
             }
         }
         let current = self.current();
         let first = current.sources;
-        let side = if batch.is_empty() {
-            current.side.clone()
-        } else {
-            let side = self.domain.apply(&batch, first, &current.side, &self.index)?;
+        let applied = std::mem::take(&mut w.applied);
+        let mut side = w.side.take().unwrap_or_else(|| current.side.clone());
+        if !batch.is_empty() {
+            if applied > 0 {
+                return Err(invalid("adds applied on arrival and at commit in one batch"));
+            }
+            side = self.domain.apply(&batch, first, &side, &self.index)?;
+        }
+        let added = applied + batch.len() as u32;
+        if added > 0 {
             self.crash_at(1)?;
             self.index.commit()?;
-            side
-        };
-        let sources = self.index.snapshot().source_count();
-        if sources != first + batch.len() as u32 {
-            return Err(invalid(format!("the domain added {} sources for {} records", sources - first, batch.len())));
+        }
+        let snapshot = self.index.snapshot();
+        let sources = snapshot.source_count();
+        if sources != first + added {
+            return Err(invalid(format!("the domain added {} sources for {added} records", sources - first)));
         }
 
-        let snapshot = self.index.snapshot();
         let mut changes = self.keys.batch(&snapshot, &current.deleted)?;
-        let mut added = batch.iter().zip(first..);
+        let mut ordinal = first;
         for op in &order {
             match op {
-                Op::Add(()) => {
-                    let (record, ordinal) = added.next().unwrap();
-                    changes.add(&self.domain.key(record), ordinal)?;
+                Op::Applied(key) => {
+                    changes.add(key, ordinal)?;
+                    ordinal += 1;
                 }
                 Op::Delete(key) => changes.delete(key),
+                Op::Add(()) => unreachable!(),
             }
         }
         self.crash_at(2)?;
@@ -366,7 +410,7 @@ impl<D: Domain> Collection<D> {
             set.insert(o);
         }
         *self.current.write().unwrap() = Arc::new(Generation { snapshot, side, deleted: Arc::new(set), sources });
-        self.reset_log(&w)
+        self.reset_log(w)
     }
 
     /// Fills an empty collection in one commit without the log, as `apply` adds the sources (in any order, such as
@@ -429,6 +473,8 @@ mod tests {
     struct Notes {
         values: larry::Blob,
         keys: Keys,
+        /// Applied as they arrive, committing once the index buffers a few hundred bytes.
+        eager: bool,
     }
 
     impl Domain for Notes {
@@ -443,6 +489,14 @@ mod tests {
 
         fn keys(&self) -> Keys {
             self.keys
+        }
+
+        fn eager(&self) -> bool {
+            self.eager
+        }
+
+        fn flush_bytes(&self) -> usize {
+            if self.eager { 400 } else { usize::MAX }
         }
 
         fn encode(&self, r: &Note, out: &mut Vec<u8>) {
@@ -492,8 +546,12 @@ mod tests {
     }
 
     fn open(dir: &std::path::Path, keys: Keys) -> Collection<Notes> {
+        open_with(dir, keys, false)
+    }
+
+    fn open_with(dir: &std::path::Path, keys: Keys, eager: bool) -> Collection<Notes> {
         let files = Store::open(dir).unwrap();
-        let domain = Notes { values: files.blob("values").unwrap(), keys };
+        let domain = Notes { values: files.blob("values").unwrap(), keys, eager };
         Collection::open(&files, domain).unwrap()
     }
 
@@ -576,9 +634,9 @@ mod tests {
     #[test]
     fn a_crash_at_each_point_of_a_commit_keeps_the_batch() {
         for point in 1..=3 {
-            for keys in [Keys::Unique, Keys::Multiple] {
+            for (keys, eager) in [(Keys::Unique, false), (Keys::Multiple, false), (Keys::Unique, true)] {
                 let dir = tempfile::tempdir().unwrap();
-                let c = open(dir.path(), keys);
+                let c = open_with(dir.path(), keys, eager);
                 c.add(vec![note("a", "x", 1), note("b", "x", 2)]).unwrap();
                 c.commit().unwrap();
                 c.add(vec![note("a", "y", 3)]).unwrap();
@@ -587,7 +645,7 @@ mod tests {
                 c.crash.store(point, std::sync::atomic::Ordering::Relaxed);
                 assert!(c.commit().is_err());
                 drop(c);
-                let c = open(dir.path(), keys);
+                let c = open_with(dir.path(), keys, eager);
                 let a = if keys == Keys::Unique { vec![3] } else { vec![1, 3] };
                 assert_eq!(live(&c), [("a".into(), a), ("c".into(), vec![4])].into(), "crash at {point}, {keys:?}");
                 assert_eq!(c.current().sources, 4);
@@ -626,14 +684,14 @@ mod tests {
     /// model; after every reopen the collection holds exactly what was acknowledged.
     #[test]
     fn survives_crashes_at_every_point() {
-        for (seed, keys) in [(1u64, Keys::Unique), (2, Keys::Multiple), (3, Keys::Unique), (4, Keys::Multiple)] {
+        for (seed, keys, eager) in [(1u64, Keys::Unique, false), (2, Keys::Multiple, false), (3, Keys::Unique, true), (4, Keys::Multiple, true)] {
             let mut state = seed;
             let mut random = move |n: u64| {
                 state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 (state >> 33) % n
             };
             let dir = tempfile::tempdir().unwrap();
-            let mut c = open(dir.path(), keys);
+            let mut c = open_with(dir.path(), keys, eager);
             let mut model: BTreeMap<String, Vec<u64>> = BTreeMap::new();
             let mut next = 0u64;
             for step in 0..400 {
@@ -664,11 +722,11 @@ mod tests {
                         c.crash.store(1 + random(3) as u8, std::sync::atomic::Ordering::Relaxed);
                         let _ = c.commit();
                         drop(c);
-                        c = open(dir.path(), keys);
+                        c = open_with(dir.path(), keys, eager);
                     }
                     _ => {
                         drop(c);
-                        c = open(dir.path(), keys);
+                        c = open_with(dir.path(), keys, eager);
                     }
                 }
                 model.retain(|_, v| !v.is_empty());

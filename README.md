@@ -34,13 +34,17 @@ pending batch, commit order, publishing, recovery, and the key table.
   between the two commits: its key change is made now, in order), or pending again. A collection from before this
   layer (a log whose checkpoint is a source count, no key table) is opened as it was, and its keys are read from the
   index once.
+- **Eager domains** (`Domain::eager`) apply records as they arrive instead of at commit, so a commit's records
+  aren't all held (documents: only their keys wait for the commit), and commit early once the index buffers
+  `Domain::flush_bytes`. Logged adds become sources in log order either way, so recovery is the same.
 - **Bulk loads** (`load`) fill an empty collection in one commit without the log, in any order (vector sorts by cell,
   geo by Z-order); the keys are read from the index after.
 
 ## Tests
 
 `cargo test`: adds, replacements and deletes in both key modes; a crash at each point of a commit; and 400 random
-operations with crashes at random points, four times, against a model of what was acknowledged (with the overlay folded every few
+operations with crashes at random points, four times (two of them eager, flushing every few hundred bytes), against a model of what was
+acknowledged (with the overlay folded every few
 commits); bulk loads with duplicate keys. Each recovery branch and each part of a key lookup was checked by breaking
 it: the tests fail for each.
 
