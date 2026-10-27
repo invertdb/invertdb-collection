@@ -2,35 +2,33 @@
 //! (the index's source table has each source's key); the table finds a key's sources by a hash of its encoding and
 //! checks each candidate's key in the index.
 //!
-//! - **The base** (blob `keys.{generation}`): the sources [0, `base_count`) that aren't deleted, as u32 ordinals in
-//!   order of (hash of the key, ordinal): 4 bytes a source. Binary search finds a key's run. Bulk loads, collections
-//!   from before the key table, and rebuilds write it.
-//! - **The overlay** (`keys.db`, b-positive): `h` + hash (u64 big-endian) + ordinal (u32 big-endian) for sources
-//!   added since the base. When it outgrows the base (and [`REBUILD_MIN`]), a commit writes a new base over every
-//!   live source and empties the overlay.
-//! - **Deleted sources:** `d` + ordinal in `keys.db`.
-//! - **What the table accounts for** (`m`): the sources and log operations it has applied, the base's generation and
-//!   count, and the overlay's count; written in the same transaction as the changes, so a commit's key changes are
-//!   one atomic step.
+//! - **The base** (blob `keys.{generation}`): the live sources [0, `base_upto`) as (the hash's high 32 bits, ordinal)
+//!   pairs, sorted: 8 bytes a source. Hashes are uniform, so interpolation search finds a key's run in a few probes
+//!   without reading any key; a key is read only for a source whose hash prefix matches.
+//! - **The overlay** (in memory): sources from `base_upto` on, by full hash. It isn't stored: those sources are in the
+//!   index, and opening hashes their keys again. Once it outgrows a quarter of the base (and [`FOLD_MIN`]), a commit
+//!   merges it into a new base, dropping deleted sources, without reading any key.
+//! - **Deleted sources** and **what the table accounts for** (the sources and log operations it has applied, and the
+//!   base's generation, size and reach) are in `keys.db` (b-positive), written in one transaction per commit.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::sync::Mutex;
 
-use b_positive::{Db, ReadTxn, WriteTxn};
+use b_positive::Db;
 use introvert::{Codec, Snapshot, SourceSet};
-use larry::{Blob, Store, View};
+use larry::{Store, View};
 
 use crate::Keys;
 
-const HASHED: u8 = b'h';
 const DELETED: u8 = b'd';
 const META: &[u8] = b"m";
 
-/// The overlay is folded into a new base once it holds more entries than this and than the base.
+/// The overlay is merged into a new base once it holds more than this and a quarter of the base.
 #[cfg(not(test))]
-pub const REBUILD_MIN: u64 = 1 << 16;
+pub const FOLD_MIN: usize = 1 << 16;
 #[cfg(test)]
-pub const REBUILD_MIN: u64 = 8; // so tests fold often
+pub const FOLD_MIN: usize = 8; // so tests fold often
 
 /// A key's hash (FNV-1a over its encoding, then mixed).
 pub fn hash(bytes: &[u8]) -> u64 {
@@ -41,6 +39,10 @@ pub fn hash(bytes: &[u8]) -> u64 {
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
     h ^ (h >> 33)
+}
+
+fn prefix(h: u64) -> u32 {
+    (h >> 32) as u32
 }
 
 fn encoded<K: Codec>(key: &K) -> Vec<u8> {
@@ -54,29 +56,29 @@ pub struct Meta {
     pub sources: u32,
     pub ops: u64,
     pub generation: u64,
+    /// Entries in the base.
     pub base_count: u32,
-    pub overlay: u64,
+    /// The base holds the live sources before this.
+    pub base_upto: u32,
 }
 
 impl Meta {
     fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(36);
-        for v in [self.sources as u64, self.ops, self.generation, self.base_count as u64, self.overlay] {
+        let mut out = Vec::with_capacity(40);
+        for v in [self.sources as u64, self.ops, self.generation, self.base_count as u64, self.base_upto as u64] {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out
     }
 
     fn decode(bytes: &[u8]) -> Meta {
-        let v = |i: usize| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
-        Meta { sources: v(0) as u32, ops: v(1), generation: v(2), base_count: v(3) as u32, overlay: v(4) }
+        let v = |i: usize| bytes.get(i * 8..i * 8 + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+        Meta { sources: v(0) as u32, ops: v(1), generation: v(2), base_count: v(3) as u32, base_upto: v(4) as u32 }
     }
 }
 
-pub struct KeyTable {
-    files: Store,
-    db: Db,
-    mode: Keys,
+fn base_name(generation: u64) -> String {
+    format!("keys.{generation}")
 }
 
 /// The base as of the table's last commit.
@@ -86,20 +88,70 @@ struct Base {
 }
 
 impl Base {
-    fn ordinal(&self, i: u32) -> u32 {
-        let at = i as usize * 4;
-        u32::from_le_bytes(self.view.as_ref().unwrap()[at..at + 4].try_into().unwrap())
+    #[inline]
+    fn entry(&self, i: u32) -> (u32, u32) {
+        let at = i as usize * 8;
+        let bytes = &self.view.as_ref().unwrap()[at..at + 8];
+        (u32::from_le_bytes(bytes[0..4].try_into().unwrap()), u32::from_le_bytes(bytes[4..8].try_into().unwrap()))
+    }
+
+    /// The ordinals whose hash prefix is `p` (interpolation search: prefixes are uniform).
+    fn run(&self, p: u32) -> Vec<u32> {
+        let (mut low, mut high) = (0u32, self.count); // the first entry with prefix >= p is in [low, high]
+        while low < high {
+            let (first, last) = (self.entry(low).0, self.entry(high - 1).0);
+            if p <= first {
+                break;
+            }
+            if p > last {
+                low = high;
+                break;
+            }
+            // a guess between low and high-1 by where p falls between their prefixes, then shrink around it
+            let span = (last - first) as u64;
+            let guess = low + (((p - first) as u64 * (high - 1 - low) as u64) / span.max(1)) as u32;
+            let guess = guess.clamp(low, high - 1);
+            if self.entry(guess).0 < p {
+                low = guess + 1;
+            } else {
+                high = guess;
+            }
+        }
+        let mut out = Vec::new();
+        let mut i = low;
+        while i < self.count {
+            let (q, o) = self.entry(i);
+            if q != p {
+                break;
+            }
+            out.push(o);
+            i += 1;
+        }
+        out
     }
 }
 
-fn base_name(generation: u64) -> String {
-    format!("keys.{generation}")
+pub struct KeyTable {
+    files: Store,
+    db: Db,
+    mode: Keys,
+    /// Sources from the base's reach on, by hash.
+    overlay: Mutex<HashMap<u64, Vec<u32>>>,
 }
 
 impl KeyTable {
     pub fn open(files: &Store, mode: Keys) -> io::Result<KeyTable> {
         let db = Db::open(files.path("keys.db")?, b_positive::Options::default())?;
-        Ok(KeyTable { files: files.clone(), db, mode })
+        let table = KeyTable { files: files.clone(), db, mode, overlay: Mutex::new(HashMap::new()) };
+        // a crash between writing a new base and recording it, or between recording it and removing the old one,
+        // leaves a base file no generation names
+        let meta = table.meta();
+        for stale in [meta.generation.wrapping_sub(1), meta.generation + 1] {
+            if stale != meta.generation {
+                table.files.remove(&base_name(stale))?;
+            }
+        }
+        Ok(table)
     }
 
     pub fn meta(&self) -> Meta {
@@ -110,8 +162,7 @@ impl KeyTable {
         if meta.base_count == 0 {
             return Ok(Base { view: None, count: 0 });
         }
-        let blob = self.files.blob(&base_name(meta.generation))?;
-        Ok(Base { view: Some(blob.view()?), count: meta.base_count })
+        Ok(Base { view: Some(self.files.blob(&base_name(meta.generation))?.view()?), count: meta.base_count })
     }
 
     /// Every deleted source, in a set of `capacity`.
@@ -127,33 +178,91 @@ impl KeyTable {
         set
     }
 
+    /// Hashes the keys of the sources the table accounts for past its base, into the overlay (on opening).
+    pub fn restore<K: Codec, U: Codec>(&self, snapshot: &Snapshot<K, U>, deleted: &SourceSet) {
+        let meta = self.meta();
+        let mut overlay = self.overlay.lock().unwrap();
+        overlay.clear();
+        for o in meta.base_upto..meta.sources.min(snapshot.source_count()) {
+            if !(o < deleted.capacity() && deleted.contains(o)) {
+                overlay.entry(hash(&encoded(&snapshot.key(o)))).or_default().push(o);
+            }
+        }
+    }
+
     /// Starts a batch of changes, against `snapshot` (which holds every source the batch names) and the sources
     /// deleted so far.
     pub fn batch<'t, K: Codec, U: Codec>(&'t self, snapshot: &'t Snapshot<K, U>, deleted: &'t SourceSet) -> io::Result<Batch<'t, K, U>> {
         let meta = self.meta();
         let base = self.base(&meta)?;
-        Ok(Batch {
-            table: self,
-            snapshot,
-            deleted,
-            read: self.db.begin_read(),
-            txn: self.db.begin_write(),
-            base,
-            meta,
-            local: HashMap::new(),
-            hashed: Vec::new(),
-            newly_deleted: HashSet::new(),
-        })
+        Ok(Batch { table: self, snapshot, deleted, base, meta, local: HashMap::new(), hashed: Vec::new(), newly_deleted: HashSet::new() })
+    }
+
+    /// Writes a base of `entries` ((hash prefix, ordinal), sorted) as the next generation and records it, with the
+    /// sources and operations accounted for and the newly deleted sources, in one transaction; empties the overlay.
+    fn replace_base(&self, entries: &[(u32, u32)], upto: u32, sources: u32, ops: u64, deleted: &[u32]) -> io::Result<()> {
+        let meta = self.meta();
+        let generation = meta.generation + 1;
+        let blob = self.files.blob(&base_name(generation))?;
+        blob.truncate(0)?;
+        let bytes: Vec<u8> = entries.iter().flat_map(|&(p, o)| p.to_le_bytes().into_iter().chain(o.to_le_bytes())).collect();
+        blob.append(&bytes)?;
+        blob.sync()?;
+        let mut txn = self.db.begin_write();
+        for &o in deleted {
+            let mut entry = vec![DELETED];
+            entry.extend_from_slice(&o.to_be_bytes());
+            txn.put(&entry, &[])?;
+        }
+        txn.put(META, &Meta { sources, ops, generation, base_count: entries.len() as u32, base_upto: upto }.encode())?;
+        txn.commit()?;
+        self.overlay.lock().unwrap().clear();
+        if meta.base_count > 0 || meta.generation > 0 {
+            self.files.remove(&base_name(meta.generation))?;
+        }
+        Ok(())
+    }
+
+    /// Builds the table for sources [0, `sources`) from the index's keys, as one base (with [`Keys::Unique`], a key's
+    /// older sources are marked deleted): for bulk loads and for collections from before the key table. `ops` is what
+    /// the table then accounts for of the log. Returns the newly deleted sources.
+    pub fn build<K: Codec, U: Codec>(&self, snapshot: &Snapshot<K, U>, sources: u32, ops: u64) -> io::Result<Vec<u32>> {
+        let already = self.deleted(sources);
+        let mut order: Vec<(u64, u32)> = (0..sources).filter(|&o| !already.contains(o)).map(|o| (hash(&encoded(&snapshot.key(o))), o)).collect();
+        order.sort_unstable();
+        let mut deleted = Vec::new();
+        if self.mode == Keys::Unique {
+            // within each run of one hash, every source but a key's last is replaced
+            let mut i = 0;
+            while i < order.len() {
+                let mut j = i + 1;
+                while j < order.len() && order[j].0 == order[i].0 {
+                    j += 1;
+                }
+                if j - i > 1 {
+                    let mut by_key: HashMap<Vec<u8>, u32> = HashMap::new();
+                    for &(_, o) in &order[i..j] {
+                        if let Some(previous) = by_key.insert(encoded(&snapshot.key(o)), o) {
+                            deleted.push(previous); // ordinals ascend within a run
+                        }
+                    }
+                }
+                i = j;
+            }
+        }
+        let gone: HashSet<u32> = deleted.iter().copied().collect();
+        let mut entries: Vec<(u32, u32)> = order.iter().filter(|(_, o)| !gone.contains(o)).map(|&(h, o)| (prefix(h), o)).collect();
+        entries.sort_unstable();
+        self.replace_base(&entries, sources, sources, ops, &deleted)?;
+        Ok(deleted)
     }
 }
 
-/// One transaction's changes to the key table.
+/// One commit's changes to the key table.
 pub struct Batch<'t, K, U> {
     table: &'t KeyTable,
     snapshot: &'t Snapshot<K, U>,
     deleted: &'t SourceSet,
-    read: ReadTxn,
-    txn: WriteTxn<'t>,
     base: Base,
     meta: Meta,
     /// Sources this batch added, by key encoding.
@@ -163,42 +272,17 @@ pub struct Batch<'t, K, U> {
 }
 
 impl<K: Codec, U: Codec> Batch<'_, K, U> {
-    fn hash_of(&self, ordinal: u32) -> u64 {
-        hash(&encoded(&self.snapshot.key(ordinal)))
-    }
-
     fn is_deleted(&self, ordinal: u32) -> bool {
         (ordinal < self.deleted.capacity() && self.deleted.contains(ordinal)) || self.newly_deleted.contains(&ordinal)
     }
 
     /// The live sources a key (encoded, and its hash) names.
     fn live(&self, key: &[u8], h: u64) -> Vec<u32> {
-        let mut found = Vec::new();
-        // the base: its run of this hash
-        let (mut low, mut high) = (0, self.base.count);
-        while low < high {
-            let mid = (low + high) / 2;
-            let o = self.base.ordinal(mid);
-            if (self.hash_of(o), o) < (h, 0) { low = mid + 1 } else { high = mid }
+        let mut found = self.base.run(prefix(h));
+        if let Some(more) = self.table.overlay.lock().unwrap().get(&h) {
+            found.extend_from_slice(more);
         }
-        while low < self.base.count {
-            let o = self.base.ordinal(low);
-            if self.hash_of(o) != h {
-                break;
-            }
-            found.push(o);
-            low += 1;
-        }
-        // the overlay, as committed before this batch
-        let mut prefix = vec![HASHED];
-        prefix.extend_from_slice(&h.to_be_bytes());
-        for (entry, _) in self.read.range_from(&prefix) {
-            if !entry.starts_with(&prefix) {
-                break;
-            }
-            found.push(u32::from_be_bytes(entry[9..13].try_into().unwrap()));
-        }
-        // a hash names the key's sources and maybe others': check each one's key
+        // a hash (or its prefix) names the key's sources and maybe others': check each one's key
         found.retain(|&o| !self.is_deleted(o) && encoded(&self.snapshot.key(o)) == key);
         found.extend(self.local.get(key).into_iter().flatten().copied().filter(|&o| !self.is_deleted(o)));
         found
@@ -226,123 +310,79 @@ impl<K: Codec, U: Codec> Batch<'_, K, U> {
     }
 
     /// Records the changes, and that the table accounts for `sources` and `ops`; returns the newly deleted sources.
-    /// Folds the overlay into a new base if it has outgrown it.
-    pub fn finish(mut self, sources: u32, ops: u64) -> io::Result<Vec<u32>> {
+    /// Merges the overlay into a new base once it has outgrown a quarter of the old one.
+    pub fn finish(self, sources: u32, ops: u64) -> io::Result<Vec<u32>> {
         let mut deleted: Vec<u32> = self.newly_deleted.iter().copied().collect();
         deleted.sort_unstable();
-        for &o in &deleted {
-            let mut entry = vec![DELETED];
-            entry.extend_from_slice(&o.to_be_bytes());
-            self.txn.put(&entry, &[])?;
-        }
-        let mut meta = Meta { sources, ops, ..self.meta };
-        meta.overlay += self.hashed.len() as u64;
-        let old_base = (meta.base_count > 0).then_some(meta.generation);
-        if meta.overlay > REBUILD_MIN.max(meta.base_count as u64) {
-            // a new base over every live source; the overlay is emptied
-            let all: SourceSet = {
-                let mut all = SourceSet::new(sources);
-                for o in 0..sources {
-                    if !self.is_deleted(o) {
-                        all.insert(o);
-                    }
+        let overlay_size = self.table.overlay.lock().unwrap().values().map(Vec::len).sum::<usize>() + self.hashed.len();
+        if overlay_size > FOLD_MIN.max(self.meta.base_count as usize / 4) {
+            // a new base: the old one and the overlay, merged, without deleted sources
+            let gone = |o: u32| self.is_deleted(o);
+            let mut extra: Vec<(u32, u32)> = self.table.overlay.lock().unwrap().iter().flat_map(|(&h, os)| os.iter().map(move |&o| (prefix(h), o))).collect();
+            extra.extend(self.hashed.iter().map(|&(h, o)| (prefix(h), o)));
+            extra.retain(|&(_, o)| !gone(o));
+            extra.sort_unstable();
+            let mut entries = Vec::with_capacity(self.base.count as usize + extra.len());
+            let mut extra = extra.into_iter().peekable();
+            for i in 0..self.base.count {
+                let e = self.base.entry(i);
+                while extra.peek().is_some_and(|&x| x < e) {
+                    entries.push(extra.next().unwrap());
                 }
-                all
-            };
-            meta.generation += 1;
-            meta.base_count = write_base(&self.table.files, meta.generation, self.snapshot, &all)?;
-            let overlay: Vec<Vec<u8>> = self.read.range_from(&[HASHED]).take_while(|(k, _)| k[0] == HASHED).map(|(k, _)| k.to_vec()).collect();
-            for entry in overlay {
-                self.txn.delete(&entry);
-            }
-            meta.overlay = 0;
-        } else {
-            let mut entries: Vec<Vec<u8>> = self
-                .hashed
-                .iter()
-                .map(|&(h, o)| {
-                    let mut entry = vec![HASHED];
-                    entry.extend_from_slice(&h.to_be_bytes());
-                    entry.extend_from_slice(&o.to_be_bytes());
-                    entry
-                })
-                .collect();
-            entries.sort_unstable();
-            self.txn.put_sorted(&entries, |_, _| Vec::new())?;
-        }
-        self.txn.put(META, &meta.encode())?;
-        self.txn.commit()?;
-        if let Some(old) = old_base.filter(|&g| g != meta.generation) {
-            self.table.files.remove(&base_name(old))?;
-        }
-        Ok(deleted)
-    }
-}
-
-/// Writes a base of `live`'s sources (sorted by key hash) as generation `generation`; returns how many it holds.
-fn write_base<K: Codec, U: Codec>(files: &Store, generation: u64, snapshot: &Snapshot<K, U>, live: &SourceSet) -> io::Result<u32> {
-    let mut order: Vec<(u64, u32)> = live.iter().map(|o| (hash(&encoded(&snapshot.key(o))), o)).collect();
-    order.sort_unstable();
-    let blob: Blob = files.blob(&base_name(generation))?;
-    blob.truncate(0)?;
-    let bytes: Vec<u8> = order.iter().flat_map(|&(_, o)| o.to_le_bytes()).collect();
-    blob.append(&bytes)?;
-    blob.sync()?;
-    Ok(order.len() as u32)
-}
-
-impl KeyTable {
-    /// Builds the table for sources [0, `sources`) from the index's keys, as one base (with [`Keys::Unique`], a key's
-    /// older sources are marked deleted): for bulk loads and for collections from before the key table. `ops` is what
-    /// the table then accounts for of the log.
-    pub fn build<K: Codec, U: Codec>(&self, snapshot: &Snapshot<K, U>, sources: u32, ops: u64) -> io::Result<Vec<u32>> {
-        let mut order: Vec<(u64, u32)> = (0..sources).map(|o| (hash(&encoded(&snapshot.key(o))), o)).collect();
-        order.sort_unstable();
-        let mut deleted = Vec::new();
-        if self.mode == Keys::Unique {
-            // within each run of one hash, every source but a key's last is replaced
-            let mut i = 0;
-            while i < order.len() {
-                let mut j = i + 1;
-                while j < order.len() && order[j].0 == order[i].0 {
-                    j += 1;
+                if !gone(e.1) {
+                    entries.push(e);
                 }
-                if j - i > 1 {
-                    let mut by_key: HashMap<Vec<u8>, u32> = HashMap::new();
-                    for &(_, o) in &order[i..j] {
-                        if let Some(previous) = by_key.insert(encoded(&snapshot.key(o)), o) {
-                            deleted.push(previous); // ordinals ascend within a run
-                        }
-                    }
-                }
-                i = j;
             }
+            entries.extend(extra);
+            self.table.replace_base(&entries, sources, sources, ops, &deleted)?;
+            return Ok(deleted);
         }
-        let mut live = SourceSet::new(sources);
-        let gone: HashSet<u32> = deleted.iter().copied().collect();
-        for &(_, o) in &order {
-            if !gone.contains(&o) {
-                live.insert(o);
-            }
-        }
-        let meta = self.meta();
-        let generation = meta.generation + 1;
-        let base_count = write_base(&self.files, generation, snapshot, &live)?;
-        let mut txn = self.db.begin_write();
+        let mut txn = self.table.db.begin_write();
         for &o in &deleted {
             let mut entry = vec![DELETED];
             entry.extend_from_slice(&o.to_be_bytes());
             txn.put(&entry, &[])?;
         }
-        let overlay: Vec<Vec<u8>> = self.db.begin_read().range_from(&[HASHED]).take_while(|(k, _)| k[0] == HASHED).map(|(k, _)| k.to_vec()).collect();
-        for entry in overlay {
-            txn.delete(&entry);
-        }
-        txn.put(META, &Meta { sources, ops, generation, base_count, overlay: 0 }.encode())?;
+        txn.put(META, &Meta { sources, ops, ..self.meta }.encode())?;
         txn.commit()?;
-        if meta.base_count > 0 {
-            self.files.remove(&base_name(meta.generation))?;
+        let mut overlay = self.table.overlay.lock().unwrap();
+        for (h, o) in self.hashed {
+            overlay.entry(h).or_default().push(o);
         }
         Ok(deleted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Interpolation search finds every prefix's run, as a scan does, over uniform and clumped prefixes.
+    #[test]
+    fn runs_are_found_as_a_scan_finds_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = Store::open(dir.path()).unwrap();
+        let mut seed = 3u64;
+        let mut random = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed >> 32
+        };
+        for (n, clumped) in [(0u32, false), (1, false), (7, false), (5000, false), (5000, true)] {
+            let mut entries: Vec<(u32, u32)> = (0..n).map(|o| (if clumped { (random() % 40) as u32 * 1000 } else { random() as u32 }, o)).collect();
+            let long = entries.first().map_or(5, |e| e.0);
+            entries.extend((0..20).map(|o| (long, n + o))); // a long run
+            entries.sort_unstable();
+            let blob = files.blob("b").unwrap();
+            blob.truncate(0).unwrap();
+            blob.append(&entries.iter().flat_map(|&(p, o)| p.to_le_bytes().into_iter().chain(o.to_le_bytes())).collect::<Vec<u8>>()).unwrap();
+            let base = Base { view: Some(blob.view().unwrap()), count: entries.len() as u32 };
+            let mut probes: Vec<u32> = entries.iter().map(|e| e.0).collect();
+            probes.extend([0, 1, u32::MAX, u32::MAX - 1]);
+            probes.extend((0..200).map(|_| random() as u32));
+            for p in probes {
+                let expected: Vec<u32> = entries.iter().filter(|e| e.0 == p).map(|e| e.1).collect();
+                assert_eq!(base.run(p), expected, "prefix {p}, {n} entries");
+            }
+        }
     }
 }

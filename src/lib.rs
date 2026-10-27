@@ -9,7 +9,7 @@
 //! **Deletes and upserts.** A source is never removed from the index; a delete marks its ordinal deleted, and
 //! queries skip deleted ordinals ([`Generation::is_live`]). With [`Keys::Unique`], adding a key that's already live
 //! replaces it (the old source is marked deleted); with [`Keys::Multiple`], a key can name several sources, and a
-//! delete removes them all. The key table ([`keys`]) finds a key's sources by hash, about 4 bytes a source.
+//! delete removes them all. The key table ([`keys`]) finds a key's sources by hash, 8 bytes a source.
 //!
 //! **Commit order and recovery.** A commit writes the domain's side data and adds the batch's records to the index
 //! in log order (so each logged add's ordinal is known), commits the index (the commit point for the sources), then
@@ -226,6 +226,8 @@ impl<D: Domain> Collection<D> {
             meta = self.keys.meta();
         }
         let deleted = self.keys.deleted(sources);
+        // the overlay: what the table accounts for past its base (not a batch the index holds but the table doesn't)
+        self.keys.restore(&snapshot, &deleted);
         // then each logged operation: accounted for; in the index but not the key table (a crash after the index's
         // commit: the log is that batch, whose key changes are made now, in order); or pending
         let committed_batch = sources > base_sources;
@@ -592,6 +594,22 @@ mod tests {
             }
         }
         out
+    }
+
+    /// A fold leaves deleted sources out of the new base.
+    #[test]
+    fn a_fold_drops_deleted_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), Keys::Unique);
+        c.add((0..40).map(|i| note(&format!("k{i}"), "w", i)).collect()).unwrap();
+        c.commit().unwrap();
+        c.delete((0..30).map(|i| format!("k{i}")).collect()).unwrap();
+        c.commit().unwrap();
+        c.add((40..60).map(|i| note(&format!("k{i}"), "w", i)).collect()).unwrap();
+        c.commit().unwrap();
+        let meta = c.keys.meta();
+        assert_eq!(meta.base_upto, meta.sources, "the overlay was folded");
+        assert_eq!(meta.base_count as usize, live(&c).len());
     }
 
     #[test]

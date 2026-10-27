@@ -22,11 +22,13 @@ pending batch, commit order, publishing, recovery, and the key table.
   (`Generation::is_live`). With `Keys::Unique` (the default), adding a live key replaces it; with `Keys::Multiple`, a
   key can name several sources (audio's recordings) and a delete removes them all.
 - **The key table** doesn't store keys again (the index's source table has them): it finds a key's sources by a hash
-  of the key and checks each candidate's key in the index. Its base is a blob of ordinals sorted by key hash (4 bytes
-  a source; bulk loads write it); sources added since are hash entries in a small
-  [b-positive](https://github.com/invertdb/b-positive) overlay, folded into a new base once it outgrows the old one.
-  The deleted set is in b-positive too. Storing each key in b-positive instead took 32 bytes a source (432 MB for
-  geo's 13.5M places, more than its whole index); hash entries alone, 19.
+  of the key and checks each candidate's key in the index. Its base is a blob of (hash prefix, ordinal) pairs sorted
+  by prefix, 8 bytes a source, found by interpolation search; sources added since are hash entries in an overlay held
+  in memory and rebuilt from the index at open. The overlay is merged into a new base, without deleted sources, once
+  it outgrows a quarter of the old one. The deleted set and the counts are in a small
+  [b-positive](https://github.com/invertdb/b-positive) table. Storing each key in b-positive instead took 32 bytes a
+  source (432 MB for geo's 13.5M places, more than its whole index); a b-positive overlay of hash entries, 19, and
+  made search's bulk load 23% slower.
 - **Commit order:** the domain's side data and index adds (in log order), the index's commit, then the batch's key
   changes in one `keys.db` transaction that also records how many sources and log operations it accounts for, then
   publishing, then the log's reset ([blammo](https://github.com/invertdb/blammo)) with those two counts.
@@ -45,7 +47,7 @@ pending batch, commit order, publishing, recovery, and the key table.
 `cargo test`: adds, replacements and deletes in both key modes; a crash at each point of a commit; and 400 random
 operations with crashes at random points, four times (two of them eager, flushing every few hundred bytes), against a model of what was
 acknowledged (with the overlay folded every few
-commits); bulk loads with duplicate keys. Each recovery branch and each part of a key lookup was checked by breaking
+commits); a fold dropping deleted sources; interpolation search against a scan; bulk loads with duplicate keys. Each recovery branch and each part of a key lookup was checked by breaking
 it: the tests fail for each.
 
 Not yet: reclaiming deleted sources (a merge that rewrites the index without them).
