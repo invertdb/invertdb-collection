@@ -9,8 +9,7 @@
 //! **Deletes and upserts.** A source is never removed from the index; a delete marks its ordinal deleted, and
 //! queries skip deleted ordinals ([`Generation::is_live`]). With [`Keys::Unique`], adding a key that's already live
 //! replaces it (the old source is marked deleted); with [`Keys::Multiple`], a key can name several sources, and a
-//! delete removes them all. The key table (each key's live ordinals) and the deleted set are kept in a b-positive
-//! file, `keys.db`.
+//! delete removes them all. The key table ([`keys`]) finds a key's sources by hash, about 4 bytes a source.
 //!
 //! **Commit order and recovery.** A commit writes the domain's side data and adds the batch's records to the index
 //! in log order (so each logged add's ordinal is known), commits the index (the commit point for the sources), then
@@ -19,16 +18,18 @@
 //! taking each operation as one of: accounted for by the key table already (skipped); in the index but not the key
 //! table, after a crash between the two commits (its key change is made now, in log order); or pending again.
 //!
-//! Storage, all in the collection's larry store: the index in the nested store `units`, the key table in `keys.db`,
-//! the log in `log`, and whatever the domain keeps beside them.
+//! Storage, all in the collection's larry store: the index in the nested store `units`, the key table in `keys.db`
+//! and `keys.{generation}`, the log in `log`, and whatever the domain keeps beside them.
 
 use std::io;
 use std::sync::{Arc, Mutex, RwLock};
 
-use b_positive::{Db, WriteTxn};
 use blammo::Log;
 use introvert::{Codec, Index, Options, Snapshot, SourceSet};
 use larry::Store;
+
+pub mod keys;
+use keys::KeyTable;
 
 /// How keys name sources.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,69 +109,12 @@ const DELETE: u8 = 1;
 /// A log's checkpoint: the sources and the operations (logged since the collection began) as of its reset.
 const CHECKPOINT: usize = 16;
 
-// keys.db: `k` + key -> the key's live ordinals (u32 big-endian each); `d` + ordinal (big-endian) -> deleted; `m` ->
-// the sources and log operations the table accounts for (u64 little-endian each)
-const KEY: u8 = b'k';
-const DELETED: u8 = b'd';
-const META: &[u8] = b"m";
-
-fn key_entry<K: Codec>(key: &K) -> Vec<u8> {
-    let mut out = vec![KEY];
-    key.encode(&mut out);
-    out
-}
-
-fn ordinals(bytes: &[u8]) -> Vec<u32> {
-    bytes.as_chunks::<4>().0.iter().map(|c| u32::from_be_bytes(*c)).collect()
-}
-
 fn u64_at(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
-}
-
-/// One transaction's changes to the key table.
-struct KeyChanges<'t, 'db> {
-    txn: &'t mut WriteTxn<'db>,
-    mode: Keys,
-    deleted: Vec<u32>,
-}
-
-impl KeyChanges<'_, '_> {
-    fn add<K: Codec>(&mut self, key: &K, ordinal: u32) -> io::Result<()> {
-        let entry = key_entry(key);
-        let mut live = self.txn.get(&entry).map(|b| ordinals(&b)).unwrap_or_default();
-        if self.mode == Keys::Unique {
-            self.deleted.append(&mut live);
-        }
-        live.push(ordinal);
-        let bytes: Vec<u8> = live.iter().flat_map(|o| o.to_be_bytes()).collect();
-        self.txn.put(&entry, &bytes)
-    }
-
-    fn delete<K: Codec>(&mut self, key: &K) {
-        let entry = key_entry(key);
-        if let Some(live) = self.txn.get(&entry) {
-            self.deleted.extend(ordinals(&live));
-            self.txn.delete(&entry);
-        }
-    }
-
-    /// Marks the deleted ordinals and records what the table now accounts for; returns the ordinals.
-    fn finish(self, sources: u32, ops: u64) -> io::Result<Vec<u32>> {
-        for &o in &self.deleted {
-            let mut entry = vec![DELETED];
-            entry.extend_from_slice(&o.to_be_bytes());
-            self.txn.put(&entry, &[])?;
-        }
-        let mut meta = (sources as u64).to_le_bytes().to_vec();
-        meta.extend_from_slice(&ops.to_le_bytes());
-        self.txn.put(META, &meta)?;
-        Ok(self.deleted)
-    }
 }
 
 struct Writer<R, K> {
@@ -184,7 +128,7 @@ pub struct Collection<D: Domain> {
     crash: std::sync::atomic::AtomicU8,
     domain: D,
     index: Index<D::Key, D::Unit>,
-    keys: Db,
+    keys: KeyTable,
     log: Log,
     writer: Mutex<Writer<D::Record, D::Key>>,
     current: RwLock<Arc<Generation<D>>>,
@@ -194,7 +138,7 @@ impl<D: Domain> Collection<D> {
     /// Opens (or creates) a collection in `files`, recovering from its log.
     pub fn open(files: &Store, domain: D) -> io::Result<Collection<D>> {
         let index: Index<D::Key, D::Unit> = Index::open_in(&files.store("units")?, domain.index_options())?;
-        let keys = Db::open(files.path("keys.db")?, b_positive::Options::default())?;
+        let keys = KeyTable::open(files, domain.keys())?;
         let log = Log::open(files.path("log")?)?;
         let snapshot = index.snapshot();
         let sources = snapshot.source_count();
@@ -227,32 +171,17 @@ impl<D: Domain> Collection<D> {
         self.writer.lock().unwrap().pending.len()
     }
 
-    fn deleted_set(&self, capacity: u32, more: impl IntoIterator<Item = u32>) -> SourceSet {
-        let read = self.keys.begin_read();
-        let mut set = SourceSet::new(capacity);
-        for (key, _) in read.range_from(&[DELETED]) {
-            if key[0] != DELETED {
-                break;
-            }
-            set.insert(u32::from_be_bytes(key[1..5].try_into().unwrap()));
-        }
-        for o in more {
-            set.insert(o);
-        }
-        set
-    }
-
     fn recover(&self) -> io::Result<()> {
         let current = self.current();
         let sources = current.sources;
-        let (accounted_sources, accounted_ops) = self.keys.begin_read().get(META).map_or((0, 0), |m| (u64_at(&m, 0) as u32, u64_at(&m, 8)));
+        let mut meta = self.keys.meta();
         // the log's checkpoint; a log from before the collection layer holds a source count only, and adds only
         let checkpoint = self.log.checkpoint().unwrap_or_default();
         let (base_sources, base_ops, legacy) = match checkpoint.len() {
             CHECKPOINT => (u64_at(&checkpoint, 0) as u32, u64_at(&checkpoint, 8), false),
-            4 => (u32::from_le_bytes(checkpoint[0..4].try_into().unwrap()), accounted_ops, true),
-            8 => (u64_at(&checkpoint, 0) as u32, accounted_ops, true),
-            _ => (sources, accounted_ops, false),
+            4 => (u32::from_le_bytes(checkpoint[0..4].try_into().unwrap()), meta.ops, true),
+            8 => (u64_at(&checkpoint, 0) as u32, meta.ops, true),
+            _ => (sources, meta.ops, false),
         };
         let mut ops = Vec::new();
         self.log.replay(|record| {
@@ -267,24 +196,26 @@ impl<D: Domain> Collection<D> {
         })?;
         let logged = ops.len() as u64;
 
-        let mut txn = self.keys.begin_write();
-        let mut changes = KeyChanges { txn: &mut txn, mode: self.domain.keys(), deleted: Vec::new() };
-        // sources before the log that the key table doesn't account for (an index from before it): their keys
-        for o in accounted_sources..base_sources.min(sources) {
-            changes.add(&current.snapshot.key(o), o)?;
+        // sources before the log that the key table doesn't account for (an index from before it): from the index
+        let snapshot = self.index.snapshot();
+        if meta.sources < base_sources.min(sources) {
+            self.keys.build(&snapshot, base_sources.min(sources), meta.ops)?;
+            meta = self.keys.meta();
         }
-        // the index holds sources past the log's base: the log is that batch, committed to the index but not to
-        // the key table, whose changes are made now, in order
+        let deleted = self.keys.deleted(sources);
+        // then each logged operation: accounted for; in the index but not the key table (a crash after the index's
+        // commit: the log is that batch, whose key changes are made now, in order); or pending
         let committed_batch = sources > base_sources;
+        let mut batch = self.keys.batch(&snapshot, &deleted)?;
         let mut pending = Vec::new();
         let mut ordinal = base_sources;
         for (n, op) in ops.into_iter().enumerate() {
-            let accounted = base_ops + (n as u64) < accounted_ops;
+            let accounted = base_ops + (n as u64) < meta.ops;
             match op {
                 Op::Add(record) => {
                     if accounted {
                     } else if ordinal < sources {
-                        changes.add(&self.domain.key(&record), ordinal)?;
+                        batch.add(&self.domain.key(&record), ordinal)?;
                     } else {
                         pending.push(Op::Add(record));
                     }
@@ -293,7 +224,7 @@ impl<D: Domain> Collection<D> {
                 Op::Delete(key) => {
                     if accounted {
                     } else if committed_batch {
-                        changes.delete(&key);
+                        batch.delete(&key);
                     } else {
                         pending.push(Op::Delete(key));
                     }
@@ -301,13 +232,12 @@ impl<D: Domain> Collection<D> {
             }
         }
         let done = base_ops + logged - pending.len() as u64;
-        let deleted = changes.finish(sources, done)?;
-        txn.commit()?;
+        batch.finish(sources, done.max(meta.ops))?;
 
-        let set = self.deleted_set(sources, deleted);
-        *self.current.write().unwrap() = Arc::new(Generation { snapshot: self.index.snapshot(), side: current.side.clone(), deleted: Arc::new(set), sources });
+        let deleted = self.keys.deleted(sources);
+        *self.current.write().unwrap() = Arc::new(Generation { snapshot, side: current.side.clone(), deleted: Arc::new(deleted), sources });
         let mut w = self.writer.lock().unwrap();
-        w.ops = done;
+        w.ops = done.max(meta.ops);
         w.pending = pending;
         if w.pending.is_empty() {
             return self.reset_log(&w);
@@ -414,8 +344,8 @@ impl<D: Domain> Collection<D> {
             return Err(invalid(format!("the domain added {} sources for {} records", sources - first, batch.len())));
         }
 
-        let mut txn = self.keys.begin_write();
-        let mut changes = KeyChanges { txn: &mut txn, mode: self.domain.keys(), deleted: Vec::new() };
+        let snapshot = self.index.snapshot();
+        let mut changes = self.keys.batch(&snapshot, &current.deleted)?;
         let mut added = batch.iter().zip(first..);
         for op in &order {
             match op {
@@ -428,7 +358,6 @@ impl<D: Domain> Collection<D> {
         }
         self.crash_at(2)?;
         let deleted = changes.finish(sources, w.ops + count)?;
-        txn.commit()?;
         w.ops += count;
         self.crash_at(3)?;
 
@@ -436,7 +365,7 @@ impl<D: Domain> Collection<D> {
         for o in current.deleted.iter().chain(deleted) {
             set.insert(o);
         }
-        *self.current.write().unwrap() = Arc::new(Generation { snapshot: self.index.snapshot(), side, deleted: Arc::new(set), sources });
+        *self.current.write().unwrap() = Arc::new(Generation { snapshot, side, deleted: Arc::new(set), sources });
         self.reset_log(&w)
     }
 
@@ -451,13 +380,7 @@ impl<D: Domain> Collection<D> {
         self.index.commit()?;
         let snapshot = self.index.snapshot();
         let sources = snapshot.source_count();
-        let mut txn = self.keys.begin_write();
-        let mut changes = KeyChanges { txn: &mut txn, mode: self.domain.keys(), deleted: Vec::new() };
-        for o in 0..sources {
-            changes.add(&snapshot.key(o), o)?;
-        }
-        let deleted = changes.finish(sources, w.ops)?;
-        txn.commit()?;
+        let deleted = self.keys.build(&snapshot, sources, w.ops)?;
         let mut set = SourceSet::new(sources);
         for o in deleted {
             set.insert(o);
@@ -669,6 +592,33 @@ mod tests {
                 assert_eq!(live(&c), [("a".into(), a), ("c".into(), vec![4])].into(), "crash at {point}, {keys:?}");
                 assert_eq!(c.current().sources, 4);
             }
+        }
+    }
+
+    #[test]
+    fn loads_keep_each_keys_last_source() {
+        for keys in [Keys::Unique, Keys::Multiple] {
+            let dir = tempfile::tempdir().unwrap();
+            let c = open(dir.path(), keys);
+            let batch: Vec<Note> = (0..300).map(|i| note(&format!("k{}", i % 100), "w", i)).collect();
+            c.load(|index| c.domain().apply(&batch, 0, &c.current().side, index)).unwrap();
+            let expected: BTreeMap<String, Vec<u64>> = (0..100)
+                .map(|k| (format!("k{k}"), if keys == Keys::Unique { vec![200 + k] } else { vec![k, 100 + k, 200 + k] }))
+                .collect();
+            assert_eq!(live(&c), expected);
+            c.add(vec![note("k5", "w", 1000)]).unwrap();
+            c.delete(vec!["k6".into()]).unwrap();
+            c.commit().unwrap();
+            drop(c);
+            let c = open(dir.path(), keys);
+            let mut expected = expected;
+            expected.remove("k6");
+            let k5 = expected.get_mut("k5").unwrap();
+            if keys == Keys::Unique {
+                k5.clear();
+            }
+            k5.push(1000);
+            assert_eq!(live(&c), expected, "{keys:?}");
         }
     }
 
