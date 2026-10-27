@@ -1,0 +1,42 @@
+# invertdb-collection
+
+The collection layer: what every invertdb service did for itself around an [introvert](https://github.com/invertdb/introvert)
+index, done once. A collection logs writes, commits them in batches and publishes each commit as a generation that
+readers share; it adds deletes and upserts, which no introvert-based service had.
+
+```rust
+let collection = Collection::open(&files, MyDomain::open(&files)?)?;
+collection.add(records)?;               // durable when it returns (write-ahead log, synced)
+collection.delete(vec![key])?;          // durable too
+collection.commit()?;                   // applied and published
+let g = collection.current();           // one commit: g.snapshot, g.side, g.is_live(source)
+```
+
+A service implements `Domain`: how a record is logged, its key, and what a commit does with a batch (write side
+data, such as vectors or coordinates, and add each record to the index). Everything else is here: the log, the
+pending batch, commit order, publishing, recovery, and the key table.
+
+## How it works
+
+- **Deletes** mark a source's ordinal deleted; the index is never rewritten. Queries skip deleted sources
+  (`Generation::is_live`). With `Keys::Unique` (the default), adding a live key replaces it; with `Keys::Multiple`, a
+  key can name several sources (audio's recordings) and a delete removes them all.
+- **The key table** (`keys.db`, a [b-positive](https://github.com/invertdb/b-positive) file) maps each key to its live
+  sources and holds the deleted set.
+- **Commit order:** the domain's side data and index adds (in log order), the index's commit, then the batch's key
+  changes in one `keys.db` transaction that also records how many sources and log operations it accounts for, then
+  publishing, then the log's reset ([blammo](https://github.com/invertdb/blammo)) with those two counts.
+- **Recovery:** each logged operation is accounted for already (skipped), in the index but not the key table (a crash
+  between the two commits: its key change is made now, in order), or pending again. A collection from before this
+  layer (a log whose checkpoint is a source count, no key table) is opened as it was, and its keys are read from the
+  index once.
+- **Bulk loads** (`load`) fill an empty collection in one commit without the log, in any order (vector sorts by cell,
+  geo by Z-order); the keys are read from the index after.
+
+## Tests
+
+`cargo test`: adds, replacements and deletes in both key modes; a crash at each point of a commit; and 400 random
+operations with crashes at random points, four times, against a model of what was acknowledged. Each recovery
+branch was checked by breaking it: the random test fails for each.
+
+Not yet: reclaiming deleted sources (a merge that rewrites the index without them).
