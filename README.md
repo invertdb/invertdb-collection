@@ -42,12 +42,18 @@ pending batch, commit order, publishing, recovery, and the key table.
 - **Bulk loads** (`load`) fill an empty collection in one commit without the log, in any order (vector sorts by cell,
   geo by Z-order); the keys are read from the index after.
 
+- **Telemetry** (the `tracing` and `opentelemetry` API crates; nothing until a service installs a subscriber and a
+  meter provider): spans `collection.open`, `.recover`, `.add`, `.delete`, `.load` and `.commit` (with `.apply`,
+  `.seal` and `.keys` inside, and the index's and log's spans below them); metrics `invertdb.collection.sources`,
+  `.deleted`, `.pending`, `.disk`, `.log` (gauges), `.commit.duration`, `.added`, `.removed`, `.operations`, each with
+  the collection's name as `invertdb.collection`; and `Collection::stats` for `/_stats`.
+
 ## Tests
 
 `cargo test`: adds, replacements and deletes in both key modes; a crash at each point of a commit; and 400 random
 operations with crashes at random points, four times (two of them eager, flushing every few hundred bytes), against a model of what was
 acknowledged (with the overlay folded every few
-commits); a fold dropping deleted sources; interpolation search against a scan; bulk loads with duplicate keys. Each recovery branch and each part of a key lookup was checked by breaking
+commits); a fold dropping deleted sources; interpolation search against a scan; bulk loads with duplicate keys; stats; and the metrics, read through an SDK meter provider (`tests/metrics.rs`). Each recovery branch and each part of a key lookup was checked by breaking
 it: the tests fail for each.
 
 Not yet: reclaiming deleted sources (a merge that rewrites the index without them).

@@ -18,11 +18,18 @@
 //! taking each operation as one of: accounted for by the key table already (skipped); in the index but not the key
 //! table, after a crash between the two commits (its key change is made now, in log order); or pending again.
 //!
+//! **Telemetry** ([`observe`]): spans for opening, recovery, adds, deletes, loads and each step of a commit; the
+//! metrics `invertdb.collection.*` (sources, deleted, pending, disk, log, commit duration, operations) with the
+//! collection's name as an attribute; and [`Collection::stats`]. All of it does nothing until a service installs a
+//! subscriber and a meter provider.
+//!
 //! Storage, all in the collection's larry store: the index in the nested store `units`, the key table in `keys.db`
 //! and `keys.{generation}`, the log in `log`, and whatever the domain keeps beside them.
 
 use std::io;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 use blammo::Log;
 use introvert::{Codec, Index, Options, Snapshot, SourceSet};
@@ -30,6 +37,9 @@ use larry::Store;
 
 pub mod keys;
 use keys::KeyTable;
+pub mod observe;
+use observe::Counters;
+pub use observe::Stats;
 
 /// How keys name sources.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,11 +165,14 @@ pub struct Collection<D: Domain> {
     log: Log,
     writer: Mutex<Writer<D::Record, D::Key, D::Side>>,
     current: RwLock<Arc<Generation<D>>>,
+    counters: Arc<Counters>,
 }
 
 impl<D: Domain> Collection<D> {
     /// Opens (or creates) a collection in `files`, recovering from its log.
     pub fn open(files: &Store, domain: D) -> io::Result<Collection<D>> {
+        let _span = tracing::info_span!("collection.open").entered();
+        let counters = Counters::register(files)?;
         let index: Index<D::Key, D::Unit> = Index::open_in(&files.store("units")?, domain.index_options())?;
         let keys = KeyTable::open(files, domain.keys())?;
         let log = Log::open(files.path("log")?)?;
@@ -175,9 +188,26 @@ impl<D: Domain> Collection<D> {
             log,
             writer: Mutex::new(Writer { pending: Vec::new(), side: None, applied: 0, ops: 0 }),
             current: RwLock::new(Arc::new(Generation { snapshot, side, deleted: Arc::new(SourceSet::new(sources)), sources })),
+            counters,
         };
         collection.recover()?;
         Ok(collection)
+    }
+
+    /// What the collection holds and has done (its counters, and its size on disk, which takes a directory walk).
+    pub fn stats(&self) -> Stats {
+        self.counters.stats()
+    }
+
+    /// Makes `generation` current, and counts it.
+    fn publish(&self, generation: Generation<D>) {
+        self.counters.sources.store(generation.sources, Ordering::Relaxed);
+        self.counters.deleted.store(generation.deleted.len() as u32, Ordering::Relaxed);
+        *self.current.write().unwrap() = Arc::new(generation);
+    }
+
+    fn count_pending(&self, w: &Writer<D::Record, D::Key, D::Side>) {
+        self.counters.pending.store(w.pending.len() as u64, Ordering::Relaxed);
     }
 
     pub fn domain(&self) -> &D {
@@ -195,6 +225,7 @@ impl<D: Domain> Collection<D> {
     }
 
     fn recover(&self) -> io::Result<()> {
+        let span = tracing::info_span!("collection.recover", logged = tracing::field::Empty, pending = tracing::field::Empty).entered();
         let current = self.current();
         let sources = current.sources;
         let mut meta = self.keys.meta();
@@ -218,6 +249,7 @@ impl<D: Domain> Collection<D> {
             Ok(())
         })?;
         let logged = ops.len() as u64;
+        span.record("logged", logged);
 
         // sources before the log that the key table doesn't account for (an index from before it): from the index
         let snapshot = self.index.snapshot();
@@ -261,10 +293,12 @@ impl<D: Domain> Collection<D> {
         batch.finish(sources, done.max(meta.ops))?;
 
         let deleted = self.keys.deleted(sources);
-        *self.current.write().unwrap() = Arc::new(Generation { snapshot, side: current.side.clone(), deleted: Arc::new(deleted), sources });
+        self.publish(Generation { snapshot, side: current.side.clone(), deleted: Arc::new(deleted), sources });
         let mut w = self.writer.lock().unwrap();
         w.ops = done.max(meta.ops);
         w.pending = pending;
+        span.record("pending", w.pending.len());
+        self.count_pending(&w);
         if w.pending.is_empty() {
             return self.reset_log(&w);
         }
@@ -294,14 +328,18 @@ impl<D: Domain> Collection<D> {
         self.log.reset(&checkpoint)
     }
 
-    fn log_ops(&self, records: Vec<Vec<u8>>) -> io::Result<()> {
+    fn log_ops(&self, kind: &'static str, records: Vec<Vec<u8>>) -> io::Result<()> {
         self.log.append_all(records.iter().map(Vec::as_slice))?;
-        self.log.sync()
+        self.log.sync()?;
+        let [name] = self.counters.attributes();
+        observe::instruments().ops.add(records.len() as u64, &[name, opentelemetry::KeyValue::new("kind", kind)]);
+        Ok(())
     }
 
     /// Adds records (with [`Keys::Unique`], replacing live ones with the same key); durable when this returns,
     /// searchable after the next commit.
     pub fn add(&self, records: Vec<D::Record>) -> io::Result<()> {
+        let _span = tracing::info_span!("collection.add", records = records.len()).entered();
         for r in &records {
             self.domain.check(r).map_err(invalid)?;
         }
@@ -314,9 +352,10 @@ impl<D: Domain> Collection<D> {
             })
             .collect();
         let mut w = self.writer.lock().unwrap();
-        self.log_ops(logged)?;
+        self.log_ops("add", logged)?;
         if !self.domain.eager() {
             w.pending.extend(records.into_iter().map(Op::Add));
+            self.count_pending(&w);
             return Ok(());
         }
         // applied now, in log order, so each source's ordinal is the one recovery would give it
@@ -326,6 +365,7 @@ impl<D: Domain> Collection<D> {
         w.side = Some(side);
         w.applied += records.len() as u32;
         w.pending.extend(records.iter().map(|r| Op::Applied(self.domain.key(r))));
+        self.count_pending(&w);
         if self.index.buffered_bytes() > self.domain.flush_bytes() {
             self.commit_locked(&mut w)?;
         }
@@ -335,6 +375,7 @@ impl<D: Domain> Collection<D> {
     /// Deletes every live source with these keys (a key with none is ignored); durable when this returns, applied
     /// at the next commit.
     pub fn delete(&self, keys: Vec<D::Key>) -> io::Result<()> {
+        let _span = tracing::info_span!("collection.delete", keys = keys.len()).entered();
         let logged: Vec<Vec<u8>> = keys
             .iter()
             .map(|k| {
@@ -344,8 +385,9 @@ impl<D: Domain> Collection<D> {
             })
             .collect();
         let mut w = self.writer.lock().unwrap();
-        self.log_ops(logged)?;
+        self.log_ops("delete", logged)?;
         w.pending.extend(keys.into_iter().map(Op::Delete));
+        self.count_pending(&w);
         Ok(())
     }
 
@@ -359,6 +401,8 @@ impl<D: Domain> Collection<D> {
         if w.pending.is_empty() {
             return Ok(());
         }
+        let span = tracing::info_span!("collection.commit", operations = w.pending.len(), added = tracing::field::Empty, deleted = tracing::field::Empty).entered();
+        let start = Instant::now();
         let ops = std::mem::take(&mut w.pending);
         let count = ops.len() as u64;
         // the adds not yet applied (all of them, unless the domain is eager; then only those replayed from the log,
@@ -383,11 +427,12 @@ impl<D: Domain> Collection<D> {
             if applied > 0 {
                 return Err(invalid("adds applied on arrival and at commit in one batch"));
             }
-            side = self.domain.apply(&batch, first, &side, &self.index)?;
+            side = tracing::info_span!("collection.apply", records = batch.len()).in_scope(|| self.domain.apply(&batch, first, &side, &self.index))?;
         }
         let added = applied + batch.len() as u32;
+        span.record("added", added);
         if added > 0 {
-            side = self.domain.seal(side)?;
+            side = tracing::info_span!("collection.seal").in_scope(|| self.domain.seal(side))?;
             self.crash_at(1)?;
             self.index.commit()?;
         }
@@ -397,6 +442,7 @@ impl<D: Domain> Collection<D> {
             return Err(invalid(format!("the domain added {} sources for {added} records", sources - first)));
         }
 
+        let keys_span = tracing::info_span!("collection.keys").entered();
         let mut changes = self.keys.batch(&snapshot, &current.deleted)?;
         let mut ordinal = first;
         for op in &order {
@@ -411,20 +457,28 @@ impl<D: Domain> Collection<D> {
         }
         self.crash_at(2)?;
         let deleted = changes.finish(sources, w.ops + count)?;
+        drop(keys_span);
+        span.record("deleted", deleted.len());
         w.ops += count;
         self.crash_at(3)?;
 
         let mut set = SourceSet::new(sources);
+        let removed = deleted.len() as u32;
         for o in current.deleted.iter().chain(deleted) {
             set.insert(o);
         }
-        *self.current.write().unwrap() = Arc::new(Generation { snapshot, side, deleted: Arc::new(set), sources });
-        self.reset_log(w)
+        self.publish(Generation { snapshot, side, deleted: Arc::new(set), sources });
+        self.count_pending(w);
+        self.reset_log(w)?;
+        self.counters.committed(start.elapsed(), added, removed);
+        Ok(())
     }
 
     /// Fills an empty collection in one commit without the log, as `apply` adds the sources (in any order, such as
     /// by cell; it returns the side data). Their keys are then read from the index. For bulk loads.
     pub fn load(&self, apply: impl FnOnce(&Index<D::Key, D::Unit>) -> io::Result<D::Side>) -> io::Result<()> {
+        let _span = tracing::info_span!("collection.load").entered();
+        let start = Instant::now();
         let w = self.writer.lock().unwrap();
         if self.current().sources > 0 || !w.pending.is_empty() {
             return Err(invalid("load needs an empty collection"));
@@ -435,11 +489,14 @@ impl<D: Domain> Collection<D> {
         let sources = snapshot.source_count();
         let deleted = self.keys.build(&snapshot, sources, w.ops)?;
         let mut set = SourceSet::new(sources);
+        let removed = deleted.len() as u32;
         for o in deleted {
             set.insert(o);
         }
-        *self.current.write().unwrap() = Arc::new(Generation { snapshot, side, deleted: Arc::new(set), sources });
-        self.reset_log(&w)
+        self.publish(Generation { snapshot, side, deleted: Arc::new(set), sources });
+        self.reset_log(&w)?;
+        self.counters.committed(start.elapsed(), sources, removed);
+        Ok(())
     }
 
     /// Commits what's pending, for a clean shutdown.
@@ -594,6 +651,29 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Stats follow adds, deletes and commits, and survive reopening.
+    #[test]
+    fn stats_count_what_the_collection_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), Keys::Unique);
+        assert_eq!((c.stats().sources, c.stats().commits, c.stats().last_commit), (0, 0, None));
+        c.add((0..10).map(|i| note(&format!("k{i}"), "w", i)).collect()).unwrap();
+        c.delete(vec!["k0".into()]).unwrap();
+        assert_eq!(c.stats().pending, 11);
+        c.commit().unwrap();
+        let s = c.stats();
+        assert_eq!((s.sources, s.deleted, s.live(), s.pending, s.commits), (10, 1, 9, 0, 1));
+        assert!(s.last_commit.is_some() && s.disk_bytes > 0);
+        assert_eq!(s.name, dir.path().file_name().unwrap().to_string_lossy());
+        c.add(vec![note("k1", "w", 99)]).unwrap(); // replaces k1
+        c.commit().unwrap();
+        assert_eq!((c.stats().sources, c.stats().deleted, c.stats().commits), (11, 2, 2));
+        drop(c);
+        let c = open(dir.path(), Keys::Unique);
+        assert_eq!((c.stats().sources, c.stats().deleted, c.stats().pending), (11, 2, 0));
+        assert_eq!(c.stats().to_json()["live"], 9);
     }
 
     /// A fold leaves deleted sources out of the new base.
