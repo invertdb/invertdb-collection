@@ -20,7 +20,11 @@ pending batch, commit order, publishing, recovery, and the key table.
 
 - **Deletes** mark a source's ordinal deleted; the index is never rewritten. Queries skip deleted sources
   (`Generation::is_live`). With `Keys::Unique` (the default), adding a live key replaces it; with `Keys::Multiple`, a
-  key can name several sources (audio's recordings) and a delete removes them all.
+  key can name several sources (audio's recordings) and a delete removes them all; with `Keys::Ordinal`, a source is
+  named by its ordinal (log lines, numbered as they arrive), so no key table is kept and a delete names one source.
+- **Durability** is the domain's: `Durability::Full` (the default) syncs the log before an add or delete returns;
+  `Durability::Process` writes it to the operating system only, for a domain whose own files aren't synced either
+  (logs). `add_numbered` returns the first record's source ordinal.
 - **The key table** doesn't store keys again (the index's source table has them): it finds a key's sources by a hash
   of the key and checks each candidate's key in the index. Its base is a blob of (hash prefix, ordinal) pairs sorted
   by prefix, 8 bytes a source, found by interpolation search; sources added since are hash entries in an overlay held

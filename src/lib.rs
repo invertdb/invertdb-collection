@@ -48,6 +48,9 @@ pub enum Keys {
     Unique,
     /// A key can name several sources (adding it again adds another); a delete removes them all.
     Multiple,
+    /// A source is named by its ordinal ([`Domain::ordinal`] reads one from a key): for records numbered as they
+    /// arrive (log lines), which no key table is needed to find. Adds never replace; a delete names one source.
+    Ordinal,
 }
 
 /// What a service supplies: its records, and what a commit does with them.
@@ -74,6 +77,18 @@ pub trait Domain: Send + Sync + 'static {
     fn decode(&self, bytes: &[u8]) -> Option<Self::Record>;
 
     fn key(&self, record: &Self::Record) -> Self::Key;
+
+    /// With [`Keys::Ordinal`], the source a key names (None: none).
+    fn ordinal(&self, _key: &Self::Key) -> Option<u32> {
+        None
+    }
+
+    /// How durable the log is: [`blammo::Durability::Full`] syncs each add and delete before it returns;
+    /// [`blammo::Durability::Process`] writes them to the operating system only (surviving the process, not the
+    /// machine), for a domain whose own files aren't synced either.
+    fn durability(&self) -> blammo::Durability {
+        blammo::Durability::Full
+    }
 
     /// Whether [`Domain::apply`] runs as records arrive (each `add`, once logged) rather than at commit: for domains
     /// whose records are large beside what they invert into (documents), so a commit's records aren't all held.
@@ -152,6 +167,8 @@ struct Writer<R, K, S> {
     side: Option<S>,
     /// Adds applied since the last commit.
     applied: u32,
+    /// Adds pending and not applied (those a commit applies).
+    unapplied: u32,
     /// Operations logged since the collection began, up to the pending ones.
     ops: u64,
 }
@@ -175,7 +192,7 @@ impl<D: Domain> Collection<D> {
         let counters = Counters::register(files)?;
         let index: Index<D::Key, D::Unit> = Index::open_in(&files.store("units")?, domain.index_options())?;
         let keys = KeyTable::open(files, domain.keys())?;
-        let log = Log::open(files.path("log")?)?;
+        let log = Log::open_with(files.path("log")?, domain.durability())?;
         let snapshot = index.snapshot();
         let sources = snapshot.source_count();
         let side = domain.open(&snapshot)?;
@@ -186,7 +203,7 @@ impl<D: Domain> Collection<D> {
             index,
             keys,
             log,
-            writer: Mutex::new(Writer { pending: Vec::new(), side: None, applied: 0, ops: 0 }),
+            writer: Mutex::new(Writer { pending: Vec::new(), side: None, applied: 0, unapplied: 0, ops: 0 }),
             current: RwLock::new(Arc::new(Generation { snapshot, side, deleted: Arc::new(SourceSet::new(sources)), sources })),
             counters,
         };
@@ -281,7 +298,7 @@ impl<D: Domain> Collection<D> {
                 Op::Delete(key) => {
                     if accounted {
                     } else if committed_batch {
-                        batch.delete(&key);
+                        self.delete_in(&mut batch, &key);
                     } else {
                         pending.push(Op::Delete(key));
                     }
@@ -296,6 +313,7 @@ impl<D: Domain> Collection<D> {
         self.publish(Generation { snapshot, side: current.side.clone(), deleted: Arc::new(deleted), sources });
         let mut w = self.writer.lock().unwrap();
         w.ops = done.max(meta.ops);
+        w.unapplied = pending.iter().filter(|op| matches!(op, Op::Add(_))).count() as u32;
         w.pending = pending;
         span.record("pending", w.pending.len());
         self.count_pending(&w);
@@ -330,15 +348,33 @@ impl<D: Domain> Collection<D> {
 
     fn log_ops(&self, kind: &'static str, records: Vec<Vec<u8>>) -> io::Result<()> {
         self.log.append_all(records.iter().map(Vec::as_slice))?;
-        self.log.sync()?;
+        if self.domain.durability() == blammo::Durability::Full {
+            self.log.sync()?;
+        }
         let [name] = self.counters.attributes();
         observe::instruments().ops.add(records.len() as u64, &[name, opentelemetry::KeyValue::new("kind", kind)]);
         Ok(())
     }
 
+    /// A delete in a batch of key changes: by key, or with [`Keys::Ordinal`] the source the key names.
+    fn delete_in(&self, batch: &mut keys::Batch<D::Key, D::Unit>, key: &D::Key) {
+        if self.domain.keys() == Keys::Ordinal {
+            if let Some(o) = self.domain.ordinal(key) {
+                batch.delete_ordinal(o);
+            }
+        } else {
+            batch.delete(key);
+        }
+    }
+
     /// Adds records (with [`Keys::Unique`], replacing live ones with the same key); durable when this returns,
     /// searchable after the next commit.
     pub fn add(&self, records: Vec<D::Record>) -> io::Result<()> {
+        self.add_numbered(records).map(|_| ())
+    }
+
+    /// [`Collection::add`], returning the first record's source ordinal (each next one's is one more).
+    pub fn add_numbered(&self, records: Vec<D::Record>) -> io::Result<u32> {
         let _span = tracing::info_span!("collection.add", records = records.len()).entered();
         for r in &records {
             self.domain.check(r).map_err(invalid)?;
@@ -353,13 +389,15 @@ impl<D: Domain> Collection<D> {
             .collect();
         let mut w = self.writer.lock().unwrap();
         self.log_ops("add", logged)?;
+        let current = self.current();
         if !self.domain.eager() {
+            let first = current.sources + w.unapplied;
+            w.unapplied += records.len() as u32;
             w.pending.extend(records.into_iter().map(Op::Add));
             self.count_pending(&w);
-            return Ok(());
+            return Ok(first);
         }
         // applied now, in log order, so each source's ordinal is the one recovery would give it
-        let current = self.current();
         let first = current.sources + w.applied;
         let side = self.domain.apply(&records, first, w.side.as_ref().unwrap_or(&current.side), &self.index)?;
         w.side = Some(side);
@@ -369,7 +407,7 @@ impl<D: Domain> Collection<D> {
         if self.index.buffered_bytes() > self.domain.flush_bytes() {
             self.commit_locked(&mut w)?;
         }
-        Ok(())
+        Ok(first)
     }
 
     /// Deletes every live source with these keys (a key with none is ignored); durable when this returns, applied
@@ -404,6 +442,7 @@ impl<D: Domain> Collection<D> {
         let span = tracing::info_span!("collection.commit", operations = w.pending.len(), added = tracing::field::Empty, deleted = tracing::field::Empty).entered();
         let start = Instant::now();
         let ops = std::mem::take(&mut w.pending);
+        w.unapplied = 0;
         let count = ops.len() as u64;
         // the adds not yet applied (all of them, unless the domain is eager; then only those replayed from the log,
         // which come before any applied on arrival), and each operation's key in order
@@ -451,7 +490,7 @@ impl<D: Domain> Collection<D> {
                     changes.add(key, ordinal)?;
                     ordinal += 1;
                 }
-                Op::Delete(key) => changes.delete(key),
+                Op::Delete(key) => self.delete_in(&mut changes, key),
                 Op::Add(()) => unreachable!(),
             }
         }
@@ -587,6 +626,10 @@ mod tests {
             r.key.clone()
         }
 
+        fn ordinal(&self, key: &String) -> Option<u32> {
+            key.parse().ok()
+        }
+
         fn check(&self, r: &Note) -> Result<(), String> {
             if r.key.is_empty() { Err("an empty key".into()) } else { Ok(()) }
         }
@@ -651,6 +694,38 @@ mod tests {
             }
         }
         out
+    }
+
+    /// With ordinal keys: adds never replace, a delete names a source by its ordinal, no key table is kept, and
+    /// deletes survive a crash before the commit and one between the index's commit and the key table's.
+    #[test]
+    fn ordinal_keys_delete_by_source() {
+        for eager in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let c = open_with(dir.path(), Keys::Ordinal, eager);
+            assert_eq!(c.add_numbered(vec![note("x", "red", 0), note("x", "red blue", 1)]).unwrap(), 0);
+            assert_eq!(c.add_numbered(vec![note("y", "blue", 2)]).unwrap(), 2, "numbered before the commit too");
+            c.commit().unwrap();
+            assert_eq!(live(&c), BTreeMap::from([("x".into(), vec![0, 1]), ("y".into(), vec![2])]), "adds don't replace");
+            c.delete(vec!["1".into(), "99".into(), "not a number".into()]).unwrap();
+            c.commit().unwrap();
+            assert_eq!(live(&c), BTreeMap::from([("x".into(), vec![0]), ("y".into(), vec![2])]), "eager {eager}");
+            assert_eq!(c.keys.meta().base_count, 0, "no key table");
+            // a crash before the commit: the delete is in the log
+            c.delete(vec!["0".into()]).unwrap();
+            drop(c);
+            let c = open_with(dir.path(), Keys::Ordinal, eager);
+            assert_eq!(live(&c), BTreeMap::from([("y".into(), vec![2])]), "recovered, eager {eager}");
+            // a crash after the index commits, before the key table: the batch's delete is made on opening
+            c.add(vec![note("z", "green", 3)]).unwrap();
+            c.delete(vec!["2".into()]).unwrap();
+            c.crash.store(2, std::sync::atomic::Ordering::Relaxed);
+            assert!(c.commit().is_err());
+            drop(c);
+            let c = open_with(dir.path(), Keys::Ordinal, eager);
+            assert_eq!(live(&c), BTreeMap::from([("z".into(), vec![3])]), "after a crash mid-commit, eager {eager}");
+            assert_eq!(with_word(&c, "blue"), BTreeSet::new());
+        }
     }
 
     /// Stats follow adds, deletes and commits, and survive reopening.

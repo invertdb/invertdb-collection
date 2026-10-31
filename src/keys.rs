@@ -183,6 +183,9 @@ impl KeyTable {
         let meta = self.meta();
         let mut overlay = self.overlay.lock().unwrap();
         overlay.clear();
+        if self.mode == Keys::Ordinal {
+            return;
+        }
         for o in meta.base_upto..meta.sources.min(snapshot.source_count()) {
             if !(o < deleted.capacity() && deleted.contains(o)) {
                 overlay.entry(hash(&encoded(&snapshot.key(o)))).or_default().push(o);
@@ -227,6 +230,10 @@ impl KeyTable {
     /// older sources are marked deleted): for bulk loads and for collections from before the key table. `ops` is what
     /// the table then accounts for of the log. Returns the newly deleted sources.
     pub fn build<K: Codec, U: Codec>(&self, snapshot: &Snapshot<K, U>, sources: u32, ops: u64) -> io::Result<Vec<u32>> {
+        if self.mode == Keys::Ordinal {
+            self.replace_base(&[], sources, sources, ops, &[])?;
+            return Ok(Vec::new());
+        }
         let already = self.deleted(sources);
         let mut order: Vec<(u64, u32)> = (0..sources).filter(|&o| !already.contains(o)).map(|o| (hash(&encoded(&snapshot.key(o))), o)).collect();
         order.sort_unstable();
@@ -289,6 +296,9 @@ impl<K: Codec, U: Codec> Batch<'_, K, U> {
     }
 
     pub fn add(&mut self, key: &K, ordinal: u32) -> io::Result<()> {
+        if self.table.mode == Keys::Ordinal {
+            return Ok(());
+        }
         let key = encoded(key);
         let h = hash(&key);
         if self.table.mode == Keys::Unique {
@@ -306,6 +316,13 @@ impl<K: Codec, U: Codec> Batch<'_, K, U> {
         let h = hash(&key);
         for o in self.live(&key, h) {
             self.newly_deleted.insert(o);
+        }
+    }
+
+    /// Deletes a source by its ordinal ([`Keys::Ordinal`]); one the index doesn't hold, or already deleted, is ignored.
+    pub fn delete_ordinal(&mut self, ordinal: u32) {
+        if ordinal < self.snapshot.source_count() && !self.is_deleted(ordinal) {
+            self.newly_deleted.insert(ordinal);
         }
     }
 
