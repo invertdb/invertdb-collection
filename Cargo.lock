@@ -5,6 +5,7 @@ version = 4
 [[package]]
 name = "b-positive"
 version = "0.1.0"
+source = "git+https://github.com/invertdb/b-positive#5eafed47cc1093f1cbe335e8d6b65ad6cebf2084"
 dependencies = [
  "crc32fast",
  "memmap2",
@@ -19,6 +20,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 [[package]]
 name = "blammo"
 version = "0.1.0"
+source = "git+https://github.com/invertdb/blammo#385d1dbe72fcaaf3e40fcd8419b2cfdd485d0028"
 dependencies = [
  "crc32fast",
  "memmap2",
@@ -152,6 +154,7 @@ dependencies = [
 [[package]]
 name = "introvert"
 version = "0.1.0"
+source = "git+https://github.com/invertdb/introvert#fd00e502f1494493a95e792c88808899d50c37c3"
 dependencies = [
  "b-positive",
  "larry",
@@ -195,6 +198,7 @@ dependencies = [
 [[package]]
 name = "larry"
 version = "0.1.0"
+source = "git+https://github.com/invertdb/larry#2b76a7b48f26c19d0f45f767ac61f95801e38718"
 dependencies = [
  "memmap2",
  "opentelemetry",
