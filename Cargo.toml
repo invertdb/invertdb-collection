@@ -10,7 +10,7 @@ repository = "https://github.com/invertdb/invertdb-collection"
 b-positive = { version = "0.1.0", git = "https://github.com/invertdb/b-positive" }
 blammo = { version = "0.1.0", git = "https://github.com/invertdb/blammo" }
 introvert = { version = "0.1.0", git = "https://github.com/invertdb/introvert" }
-larry = { version = "0.1.0", git = "https://github.com/invertdb/larry" }
+larry = { package = "invertdb-larry", version = "0.1.0", git = "https://github.com/invertdb/larry" }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics"] }
 serde_json = "1.0.154"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
