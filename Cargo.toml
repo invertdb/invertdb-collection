@@ -3,12 +3,14 @@ name = "invertdb-collection"
 version = "0.1.0"
 edition = "2024"
 description = "The collection layer: a write-ahead-logged, committed and published introvert index with side data, deletes and upserts"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/invertdb/invertdb-collection"
 
 [dependencies]
-b-positive = { version = "0.1.0", path = "../b-positive" }
-blammo = { version = "0.1.0", path = "../blammo" }
-introvert = { version = "0.1.0", path = "../introvert" }
-larry = { version = "0.1.0", path = "../larry" }
+b-positive = { version = "0.1.0", git = "https://github.com/invertdb/b-positive" }
+blammo = { version = "0.1.0", git = "https://github.com/invertdb/blammo" }
+introvert = { version = "0.1.0", git = "https://github.com/invertdb/introvert" }
+larry = { version = "0.1.0", git = "https://github.com/invertdb/larry" }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics"] }
 serde_json = "1.0.154"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
